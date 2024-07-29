@@ -3,21 +3,20 @@ mod oneinch_v4;
 mod oneinch_v5;
 mod paraswap_v5;
 mod uniswap_v3;
-mod universal_router;
+pub mod universal_router;
 mod zerox;
 
-use std::{cell::Cell, future::IntoFuture, io::Read, sync::Once};
+use std::{cell::{Cell, OnceCell}, future::IntoFuture, io::Read, sync::Once};
 
 use alloy::{
     eips::BlockNumberOrTag,
-    primitives::{Address, TxHash, U256},
+    primitives::{Address, LogData, TxHash, U256},
     providers::{ext::TraceApi, network::TransactionResponse, Provider, ProviderBuilder},
     rpc::types::{
         trace::{
             geth::TraceResult,
             parity::{TraceResults, TraceType},
-        },
-        Index, Transaction, TransactionReceipt,
+        }, Index, Log, Transaction, TransactionReceipt
     },
 };
 use eyre::{eyre, OptionExt};
@@ -87,50 +86,46 @@ pub struct DecoderContext {
     rt: tokio::runtime::Runtime,
     rpc_url: String,
 
-    tx: Option<Transaction>,
-    receipt: Option<TransactionReceipt>,
-    trace: Option<TraceResults>,
+    tx: Transaction,
+    receipt: OnceCell<TransactionReceipt>,
+    trace: OnceCell<TraceResults>,
 }
 
 impl DecoderContext {
-    pub fn new(rpc_url: String) -> eyre::Result<Self> {
+    pub fn decode(rpc_url: String, pos: TxPos) -> eyre::Result<()> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        Ok(Self {
-            rt,
-            rpc_url,
 
-            tx: None,
-            receipt: None,
-            trace: None,
-        })
-    }
-
-    pub fn decode(&mut self, pos: TxPos) -> eyre::Result<()> {
         let decoders: Vec<Box<dyn Decoder>> = vec![Box::new(DecoderUnivesalRouter::new())];
         let tx = match pos {
-            TxPos::Hash(hash) => self.rt.block_on(get_tx(&self.rpc_url, &hash))?,
+            TxPos::Hash(hash) => rt.block_on(get_tx(&rpc_url, &hash))?,
             TxPos::Pos(block, index) => {
-                self.rt
-                    .block_on(get_tx_by_pos(&self.rpc_url, &block, &index))?
+                rt.block_on(get_tx_by_pos(&rpc_url, &block, &index))?
             }
         };
-        let (receipt, trace) = self.rt.block_on(async {
-            tokio::join!(
-                get_tx_receipt(&self.rpc_url, &tx.hash).into_future(),
-                get_tx_trace(&self.rpc_url, &tx.hash).into_future(),
-            )
-        });
-        self.tx.replace(tx);
-        self.receipt.replace(receipt?);
-        self.trace.replace(trace?);
+        // let (receipt, trace) = self.rt.block_on(async {
+        //     tokio::join!(
+        //         get_tx_receipt(&self.rpc_url, &tx.hash).into_future(),
+        //         get_tx_trace(&self.rpc_url, &tx.hash).into_future(),
+        //     )
+        // });
+        // self.receipt.replace(receipt?);
+        // self.trace.replace(trace?);
 
-        let tx = self.tx.as_ref().unwrap();
-        let to_addr = tx
+        let to_addr = &tx
             .to()
             .ok_or(eyre!("creation transaction is not supported"))?;
-        let selector = extract_selector(tx)?;
+        let selector = extract_selector(&tx)?;
+
+        let context = DecoderContext {
+            rt,
+            tx,
+            rpc_url,
+
+            receipt: OnceCell::new(),
+            trace: OnceCell::new(),
+        };
         for decoder in decoders {
             if !decoder.supported_address().contains(&to_addr) {
                 continue;
@@ -138,17 +133,41 @@ impl DecoderContext {
             if !decoder.supported_selectors().contains(&selector) {
                 continue;
             }
-            let swap_info = decoder.decode(&self)?;
+            let swap_info = decoder.decode(&context)?;
+            // match decoder.name() {
+                // universal_router::consts::NAME => {}
+                // _ => unreachable!("decoder is not present"),
+            // }
         }
         Ok(())
     }
 
     pub fn tx(&self) -> &Transaction {
-        self.tx.as_ref().unwrap()
+        &self.tx
     }
 
-    pub fn trace(&self) -> &TraceResults {
-        self.trace.as_ref().unwrap()
+    pub fn trace(&self) -> eyre::Result<&TraceResults> {
+        if self.trace.get().is_none() {
+            let trace = self
+                .rt
+                .block_on(get_tx_trace(&self.rpc_url, &self.tx().hash))?;
+            self.trace.set(trace).unwrap();
+        }
+        Ok(self.trace.get().unwrap())
+    }
+
+    pub fn receipt(&self) -> eyre::Result<&TransactionReceipt> {
+        if self.receipt.get().is_none() {
+            let receipt = self
+                .rt
+                .block_on(get_tx_receipt(&self.rpc_url, &self.tx().hash))?;
+            self.receipt.set(receipt).unwrap();
+        }
+        Ok(self.receipt.get().unwrap())
+    }
+
+    pub fn logs(&self) -> eyre::Result<&[Log<LogData>]> {
+        Ok(self.receipt()?.inner.logs())
     }
 }
 

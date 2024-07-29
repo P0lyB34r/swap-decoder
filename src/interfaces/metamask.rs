@@ -1,12 +1,14 @@
 use alloy::{
-    providers::network::TransactionResponse, rpc::types::Transaction, sol, sol_types::{SolCall, SolInterface},
+    primitives::Address, providers::network::TransactionResponse, rpc::types::Transaction, sol, sol_types::{SolCall, SolInterface}
 };
 use eyre::eyre;
+
+use super::Decoder;
 
 mod consts {
     use alloy::primitives::{address, b256, Address, B256};
 
-    pub const NAME: String = "MetaMask Swap Router".to_string();
+    pub const NAME: &str = "MetaMask Swap Router";
     pub const ROUTER: Address = address!("881d40237659c251811cec9c364ef91dc08d300c");
 }
 
@@ -55,13 +57,13 @@ impl DecoderMetaMaskSwapRouter {
     }
 }
 
-impl Decoder for DecoderUnivesalRouter {
+impl Decoder for DecoderMetaMaskSwapRouter {
     fn name(&self) -> String {
-        consts::NAME
+        consts::NAME.to_string()
     }
 
     fn supported_address(&self) -> Vec<Address> {
-        vec![consts::ROUTER, consts::ROUTER_V2]
+        vec![consts::ROUTER]
     }
 
     fn supported_selectors(&self) -> Vec<[u8; 4]> {
@@ -69,6 +71,8 @@ impl Decoder for DecoderUnivesalRouter {
     }
 
     fn decode(&self, context: &super::DecoderContext) -> eyre::Result<super::Swap> {
+        let tx = context.tx();
+
         match MetaSwap::MetaSwapCalls::abi_decode(&tx.input, true)? {
             MetaSwap::MetaSwapCalls::swap(call) => {
                 let input_token = call.tokenFrom;

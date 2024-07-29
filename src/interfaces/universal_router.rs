@@ -1,24 +1,26 @@
 use std::io::Read;
 
 use alloy::{
-    primitives::{address, b256, bytes::Buf, keccak256, Address, Bytes, Signed, B256, I256, U256},
+    primitives::{
+        address, b256, bytes::Buf, keccak256, Address, Bytes, LogData, Signed, B256, I256, U256,
+    },
     providers::network::TransactionResponse,
     rpc::types::{
         trace::parity::{Action, CallType, TraceOutput, TransactionTrace},
-        Transaction,
+        Log, Transaction,
     },
     sol,
-    sol_types::{SolCall, SolInterface, SolType, SolValue},
+    sol_types::{SolCall, SolEvent, SolInterface, SolType, SolValue},
 };
 use eyre::eyre;
 use serde::{Deserialize, Serialize};
 
 use super::Decoder;
 
-mod consts {
+pub mod consts {
     use alloy::primitives::{address, b256, Address, B256};
 
-    pub const NAME: String = "Uniswap Universal Router".to_string();
+    pub const NAME: &str = "Uniswap Universal Router";
     pub const ROUTER: Address = address!("3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD");
     pub const ROUTER_V2: Address = address!("Ef1c6E67703c7BD7107eed8303Fbe6EC2554BF6B");
 
@@ -69,15 +71,24 @@ interface Dispatcher {
         uint256 sigDeadline;
     }
 
-    function swap(
-        address recipient,
-        bool zeroForOne,
-        int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        bytes calldata data
-    ) external returns (int256 amount0, int256 amount1);
+    event Swap(
+        address indexed sender,
+        address indexed recipient,
+        int256 amount0,
+        int256 amount1,
+        uint160 sqrtPriceX96,
+        uint128 liquidity,
+        int24 tick
+    );
 
-    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
 }
 
 }
@@ -134,7 +145,7 @@ impl DecoderUnivesalRouter {
 
 impl Decoder for DecoderUnivesalRouter {
     fn name(&self) -> String {
-        consts::NAME
+        consts::NAME.to_string()
     }
 
     fn supported_address(&self) -> Vec<Address> {
@@ -149,6 +160,7 @@ impl Decoder for DecoderUnivesalRouter {
     fn decode(&self, context: &super::DecoderContext) -> eyre::Result<super::Swap> {
         use UniversalRouter::UniversalRouterCalls as C;
         let msg_sender = context.tx().from();
+        let router = context.tx().to().unwrap();
 
         let (commands, inputs) = match C::abi_decode(&context.tx().input, true)? {
             C::execute_0(call) => (call.commands, call.inputs),
@@ -164,9 +176,10 @@ impl Decoder for DecoderUnivesalRouter {
                         Params::abi_decode_params(&inputs[index], true)?;
 
                     let swap = v3_decode_swap(
+                        &router,
                         SwapType::ExactIn(amount_in),
                         &path,
-                        &context.trace().trace,
+                        &context.logs()?,
                     )?;
                     println!("V3_SWAP_EXACT_IN: {:?}", swap);
                 }
@@ -176,9 +189,10 @@ impl Decoder for DecoderUnivesalRouter {
                         Params::abi_decode_params(&inputs[index], true)?;
 
                     let swap = v3_decode_swap(
+                        &router,
                         SwapType::ExactOut(amount_out),
                         &path,
-                        &context.trace().trace,
+                        &context.logs()?,
                     )?;
                     println!("V3_SWAP_EXACT_OUT: {:?}", swap);
                 }
@@ -186,7 +200,14 @@ impl Decoder for DecoderUnivesalRouter {
                     type Params = sol!((address, uint256, uint256, address[], bool));
                     let (recipient, amount_in, amount_out_min, path, payer_is_user) =
                         Params::abi_decode_params(&inputs[index], true)?;
-                    println!("V2_SWAP_EXACT_IN: {:?} {:?}", path, recipient);
+
+                    let swap = v2_decode_swap(
+                        &router,
+                        SwapType::ExactIn(amount_in),
+                        &path,
+                        &context.logs()?,
+                    )?;
+                    println!("V2_SWAP_EXACT_IN: {:?}", swap);
                     // let swap = v2_decode_swap(&path, &context.trace().trace)?;
                 }
                 command_types::V2_SWAP_EXACT_OUT => {
@@ -194,7 +215,13 @@ impl Decoder for DecoderUnivesalRouter {
                     let (recipient, amount_out, amount_in_max, path, payer_is_user) =
                         Params::abi_decode_params(&inputs[index], true)?;
 
-                    let swap = v2_decode_swap(&path, &context.trace().trace)?;
+                    let swap = v2_decode_swap(
+                        &router,
+                        SwapType::ExactOut(amount_out),
+                        &path,
+                        &context.logs()?,
+                    )?;
+                    println!("V2_SWAP_EXACT_OUT: {:?}", swap);
                 }
 
                 // non-swap commands: 0x00 <= command < 0x08
@@ -253,8 +280,8 @@ impl Decoder for DecoderUnivesalRouter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwapInfo {
-    pools: Vec<Address>,
+struct SwapEntry {
+    pools: Vec<Pool>,
     token_in: Address,
     token_out: Address,
     amount_in: U256,
@@ -267,118 +294,152 @@ enum SwapType {
 }
 
 fn v3_decode_swap(
-    t: SwapType,
+    router: &Address,
+    swap_type: SwapType,
     path: &Bytes,
-    traces: &Vec<TransactionTrace>,
-) -> eyre::Result<SwapInfo> {
-    let analyze_swap = |pool: &Address| -> eyre::Result<(bool, (U256, U256))> {
-        let pool_calls = traces
+    logs: &[Log<LogData>],
+) -> eyre::Result<SwapEntry> {
+    let analyze_swap = |pool: &Address| -> eyre::Result<U256> {
+        let swap_logs = logs
             .iter()
-            .filter_map(|trace| {
-                let (a, i) = trace
-                    .action
-                    .as_call()
-                    .map(|action| (&action.to, &action.input))?;
-                let o = trace.result.as_ref().map(|output| output.output())?;
-                Some((a, i, o))
+            .filter(|log| log.address() == *pool && !log.removed)
+            .filter_map(|log| {
+                let swap = Dispatcher::Swap_0::decode_log(&log.inner, true).ok()?;
+                match swap.sender == *router {
+                    true => Some((swap.amount0, swap.amount1)),
+                    false => None,
+                }
             })
-            .filter(|(addr, _, _)| **addr == *pool)
-            .map(|(_, input, output)| (input, output))
             .collect::<Vec<_>>();
-
-        if pool_calls.len() > 1 {
+        if swap_logs.len() != 1 {
             return Err(eyre!("multiple pool calls not supported"));
         }
-        let (input, output) = pool_calls[pool_calls.len() - 1];
-        let swap_params = Dispatcher::swap_0Call::abi_decode(&input, true)?;
-        type CallReturn = sol!((int256, int256));
-        let amounts = CallReturn::abi_decode_params(&output, true)
-            .map(|(a, b)| (a.abs().into_raw(), b.abs().into_raw()))?;
-        Ok((swap_params.zeroForOne, amounts))
+        let (amount_0, amount_1) = swap_logs[0];
+        Ok(if amount_0.is_negative() {
+            amount_0.abs().into_raw()
+        } else {
+            amount_1.abs().into_raw()
+        })
     };
 
-    let paths = v3_decode_path(&path);
-    let (token_in, token_out, amount_in, amount_out) = match t {
+    let pools = v3_decode_path(&path);
+    if pools.is_empty() {
+        return Err(eyre!("no path found"));
+    }
+    let (token_in, token_out) = (
+        pools.first().unwrap().token_in,
+        pools.last().unwrap().token_out,
+    );
+    let (amount_in, amount_out) = match swap_type {
         SwapType::ExactIn(amount_in) => {
-            let last_pool = paths.last().ok_or(eyre!("no path found"))?;
-            let (zero_for_one, (last_token0, last_token1)) = analyze_swap(&last_pool.pool)?;
-            let (token_out, amount_out) = match zero_for_one {
-                true => (last_pool.token_out, last_token1),
-                false => (last_pool.token_in, last_token0),
-            };
-            (token_out, amount_in, amount_out)
+            let amount_out = analyze_swap(&pools.last().unwrap().pool)?;
+            (amount_in, amount_out)
         }
         SwapType::ExactOut(amount_out) => {
-            let first_path = paths.last().ok_or(eyre!("no path found"))?;
-            let (zero_for_one, (first_token0, first_token1)) = analyze_swap(&first_pool.pool)?;
-            let amount_in = match zero_for_one {
-                true => first_token0,
-                false => first_token1,
-            };
+            let amount_in = analyze_swap(&pools.first().unwrap().pool)?;
             (amount_in, amount_out)
         }
     };
-    println!("paths: {:?} {:?} {:?}", paths, amount_in, amount_out);
-    todo!()
-    // Ok(SwapInfo {
-    //     pools: first_pool.pool,
-    //     token_in: first_pool.token0,
-    //     token_out: first_pool.token1,
-    //     fee: first_pool.fee,
-    //     amount_in: amount0,
-    //     amount_out: amount1,
-    // })
+    Ok(SwapEntry {
+        pools,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out,
+    })
 }
 
 fn v2_decode_swap(
+    router: &Address,
+    swap_type: SwapType,
     path: &Vec<Address>,
-    traces: &Vec<TransactionTrace>,
-) -> eyre::Result<SwapInfo> {
-    if path.len() > 2 {
-        return Err(eyre!("multiple pools not supported"));
-    }
-    let token0 = path[0];
-    let token1 = path[1];
-    let pool = v2_compute_pool_address(token0, token1, None, None);
-
-    let pool_calls = traces
-        .iter()
-        .filter_map(|trace| {
-            let (a, i) = trace
-                .action
-                .as_call()
-                .filter(|action| action.call_type == CallType::Call)
-                .map(|action| (&action.to, &action.input))?;
-            let o = trace.result.as_ref().map(|output| output.output())?;
-            Some((a, i, o))
+    logs: &[Log<LogData>],
+) -> eyre::Result<SwapEntry> {
+    let analyze_swap = |pool: &Address| -> eyre::Result<U256> {
+        let swap_logs = logs
+            .iter()
+            .filter(|log| log.address() == *pool && !log.removed)
+            .filter_map(|log| {
+                let swap = Dispatcher::Swap_1::decode_log(&log.inner, true).ok()?;
+                match swap.sender == *router {
+                    true => Some((swap.amount0Out, swap.amount1Out)),
+                    false => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if swap_logs.len() != 1 {
+            return Err(eyre!("multiple pool calls not supported"));
+        }
+        let (amount_0, amount_1) = swap_logs[0];
+        Ok(if amount_0.is_zero() {
+            amount_0
+        } else {
+            amount_1
         })
-        .filter(|(addr, _, _)| **addr == pool)
-        .collect::<Vec<_>>();
-    println!("{:?}", pool_calls);
-    if pool_calls.len() > 1 {
-        return Err(eyre!("multiple pool calls not supported"));
-    }
+    };
 
-    let (_, input, output) = pool_calls[pool_calls.len() - 1];
-    let swap_call = Dispatcher::swap_1Call::abi_decode(&input, true)?;
-    todo!()
-    // Ok(SwapInfo {
-    //     pools: pool,
-    //     token_in: token0,
-    //     token_out: token1,
-    //     fee: 0,
-    //     amount_in: I256::from_raw(swap_call.amount0Out),
-    //     amount_out: I256::from_raw(swap_call.amount1Out),
-    // })
+    let pools = path
+        .windows(2)
+        .map(|a| {
+            let (token_in, token_out) = (a[0], a[1]);
+            Pool {
+                token_in,
+                token_out,
+                fee: 0,
+                pool: v2_compute_pool_address(token_in, token_out, None, None),
+                reverse: token_in > token_out,
+            }
+        })
+        .collect::<Vec<_>>();
+    if pools.is_empty() {
+        return Err(eyre!("no path found"));
+    }
+    let (token_in, token_out) = (
+        pools.first().unwrap().token_in,
+        pools.last().unwrap().token_out,
+    );
+    let (amount_in, amount_out) = match swap_type {
+        SwapType::ExactIn(amount_in) => {
+            let amount_out = analyze_swap(&pools.last().unwrap().pool)?;
+            (amount_in, amount_out)
+        }
+        SwapType::ExactOut(amount_out) => {
+            let amount_in = analyze_swap(&pools.first().unwrap().pool)?;
+            (amount_in, amount_out)
+        }
+    };
+    Ok(SwapEntry {
+        pools,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out,
+    })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pool {
     token_in: Address,
     token_out: Address,
     fee: u32,
     pool: Address,
     reverse: bool, // if true, it means token_in > token_out
+}
+
+impl Pool {
+    fn token_0(&self) -> Address {
+        match self.reverse {
+            true => self.token_out,
+            false => self.token_in,
+        }
+    }
+
+    fn token_1(&self) -> Address {
+        match self.reverse {
+            false => self.token_out,
+            true => self.token_in,
+        }
+    }
 }
 
 fn v3_decode_path(path: &Bytes) -> Vec<Pool> {
